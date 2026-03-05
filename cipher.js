@@ -82,10 +82,18 @@ async function _hmac(key, data) {
 async function cipherEncrypt(text, key) {
   const t = text.toUpperCase();
   const spaces = [];
-  for (let i = 0; i < t.length; i++) if (t[i] === ' ') spaces.push(i);
-
-  const plain = [];
-  for (const c of t) if (ALPHA.includes(c)) plain.push(ALPHA.indexOf(c));
+const plain = [];
+const spaces = [];
+let outputPos = 0;
+for (const c of t) {
+  if (c === ' ') {
+    spaces.push(outputPos++);
+  } else if (ALPHA.includes(c)) {
+    plain.push(ALPHA.indexOf(c));
+    outputPos++;
+  }
+  // non-letter, non-space chars are simply ignored (outputPos unchanged)
+}
   if (!plain.length) return '[error: no letters]';
 
   const nonceStr  = _toAlpha(crypto.getRandomValues(new Uint8Array(16)));
