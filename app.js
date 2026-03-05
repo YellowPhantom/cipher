@@ -69,7 +69,8 @@ function hideStatus() {
 async function process() {
   if (processing) return;
   const text = inputText.value.trim();
-  const key  = keyInput.value.trim() || 'YELLOWPHANTOM';
+    const key = keyInput.value.trim();
+    if (!key) { showStatus('Please enter a key.', 'error'); return; }
   if (!text) { showStatus('Please enter a message first.', 'error'); return; }
 
   processing = true;
