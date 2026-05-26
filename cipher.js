@@ -1,45 +1,30 @@
 'use strict';
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-const ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function _toAlpha(bytes) {
-  return Array.from(bytes).map(b => ALPHA[b % 26]).join('');
-}
-function _encNum(n, w) {
-  const r = [];
-  for (let i = 0; i < w; i++) { r.push(ALPHA[n % 26]); n = Math.floor(n / 26); }
-  return r.reverse().join('');
-}
-function _decNum(s) {
-  let n = 0;
-  for (const c of s) n = n * 26 + ALPHA.indexOf(c);
-  return n;
-}
 
-async function _derive(key, nonceStr) {
+// Derives a 96-byte master key material from the password and nonce
+async function _derive(key, nonce) {
   const raw = await crypto.subtle.importKey(
     'raw', new TextEncoder().encode(key), 'PBKDF2', false, ['deriveBits']
   );
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: new TextEncoder().encode(nonceStr), iterations: 200_000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: nonce, iterations: 200_000, hash: 'SHA-256' },
     raw, 96 * 8
   );
   return new Uint8Array(bits);
 }
 
-// Bug 3 fixed: each i uses a unique pair of seed bytes, no modulo recycling
+// Generates a 256-byte Substitution Box (S-Box) and its inverse from a seed
 function _makeSub(seed) {
-  const perm = Array.from({ length: 26 }, (_, i) => i);
-  for (let i = 25; i > 0; i--) {
+  const perm = Array.from({ length: 256 }, (_, i) => i);
+  for (let i = 255; i > 0; i--) {
     const a = seed[i % seed.length];
     const b = seed[(i * 7 + 1) % seed.length];
     const j = ((a << 8) | b) % (i + 1);
     [perm[i], perm[j]] = [perm[j], perm[i]];
   }
-  const inv = new Array(26).fill(0);
-  for (let i = 0; i < 26; i++) inv[perm[i]] = i;
+  const inv = new Array(256).fill(0);
+  for (let i = 0; i < 256; i++) inv[perm[i]] = i;
   return [perm, inv];
 }
 
@@ -47,124 +32,166 @@ async function _sha256(data) {
   return new Uint8Array(await crypto.subtle.digest('SHA-256', data));
 }
 
+// Generates a deterministic keystream of length `n` bytes
 async function _ks(seed, n) {
-  const out = [];
-  let blk = 0;
-  while (out.length < n) {
+  const out = new Uint8Array(n);
+  let blk = 0, pos = 0;
+  while (pos < n) {
     const buf = new Uint8Array(seed.length + 4);
     buf.set(seed);
     new DataView(buf.buffer).setUint32(seed.length, blk, false);
     const hash = await _sha256(buf);
-    for (const b of hash) out.push(b % 26);
+    for (let i = 0; i < hash.length && pos < n; i++) {
+      out[pos++] = hash[i];
+    }
     blk++;
   }
-  return out.slice(0, n);
+  return out;
 }
 
-// Self-inverse: applying twice restores original
+// Self-inverse array block shuffler
 function _shuffle(lst, size) {
-  const result = [];
+  const result = new Uint8Array(lst.length);
+  let pos = 0;
   for (let i = 0; i * size < lst.length; i++) {
     const block = lst.slice(i * size, (i + 1) * size);
-    result.push(...(i % 2 === 1 ? block.reverse() : block));
+    if (i % 2 === 1) block.reverse();
+    result.set(block, pos);
+    pos += block.length;
   }
   return result;
 }
 
-async function _hmac(key, data) {
-  const k = await crypto.subtle.importKey(
-    'raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  );
-  return new Uint8Array(await crypto.subtle.sign('HMAC', k, data));
+// Safe Base64 encoding/decoding for arbitrary byte lengths
+function bytesToBase64(bytes) {
+  let binString = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binString += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binString);
+}
+
+function base64ToBytes(base64) {
+  const cleanB64 = base64.replace(/\s+/g, ''); // Fix: allows decrypting formatted/spaced Base64
+  const binString = atob(cleanB64);
+  const bytes = new Uint8Array(binString.length);
+  for (let i = 0; i < binString.length; i++) {
+    bytes[i] = binString.charCodeAt(i);
+  }
+  return bytes;
 }
 
 // ── Encrypt ───────────────────────────────────────────────────────────────────
 async function cipherEncrypt(text, key) {
-  const t = text.toUpperCase();
+  const plain = new TextEncoder().encode(text);
+  if (!plain.length) return '[error: empty message]';
 
-  // Bug 1 fixed: track positions in the letter+space output stream
-  const plain = [];
-  const spaces = [];
-  let outputPos = 0;
-  for (const c of t) {
-    if (c === ' ') {
-      spaces.push(outputPos++);
-    } else if (ALPHA.includes(c)) {
-      plain.push(ALPHA.indexOf(c));
-      outputPos++;
-    }
-    // non-letter, non-space chars are ignored (outputPos unchanged)
-  }
-
-  if (!plain.length) return '[error: no letters]';
-  const nonceStr = _toAlpha(crypto.getRandomValues(new Uint8Array(16)));
-  const dk = await _derive(key, nonceStr);
+  const nonce = crypto.getRandomValues(new Uint8Array(16));
+  const dk = await _derive(key, nonce);
   const [SUB] = _makeSub(dk.slice(0, 32));
   const ksMaster = dk.slice(32, 64);
   const macKey   = dk.slice(64, 96);
 
-  // Bug 2 fixed: 3-digit space count (max 17575) and 4-digit positions (max 456975)
-  const spHdr = _encNum(spaces.length, 3) + spaces.map(p => _encNum(p, 4)).join('');
-
-  let state = [...plain];
+  let state = new Uint8Array(plain);
+  
+  // 3-Round Substitution-Permutation Network
   for (let rnd = 0; rnd < 3; rnd++) {
     const rndBuf = new Uint8Array(ksMaster.length + 1);
     rndBuf.set(ksMaster); rndBuf[ksMaster.length] = rnd;
     const rndSeed = await _sha256(rndBuf);
     const keystream = await _ks(rndSeed, state.length);
-    const out = []; let prev = 0;
+    
+    const out = new Uint8Array(state.length);
+    let prev = 0;
     for (let i = 0; i < state.length; i++) {
-      const enc = (SUB[state[i]] + keystream[i] + prev) % 26;
-      prev = enc; out.push(enc);
+      const enc = (SUB[state[i]] + keystream[i] + prev) % 256;
+      prev = enc; 
+      out[i] = enc;
     }
     state = _shuffle(out, 7 + rnd * 2);
   }
-  const body    = state.map(v => ALPHA[v]).join('');
-  const payload = nonceStr + spHdr + body;
-  const tag     = _toAlpha((await _hmac(macKey, new TextEncoder().encode(payload))).slice(0, 10));
-  return nonceStr + spHdr + tag + body;
+
+  // HMAC Authentication
+  const payload = new Uint8Array(nonce.length + state.length);
+  payload.set(nonce); payload.set(state, nonce.length);
+
+  const k = await crypto.subtle.importKey(
+    'raw', macKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const fullTag = new Uint8Array(await crypto.subtle.sign('HMAC', k, payload));
+  const tag = fullTag.slice(0, 10);
+
+  // Combine Nonce (16) + Tag (10) + Ciphertext (N)
+  const final = new Uint8Array(16 + 10 + state.length);
+  final.set(nonce, 0);
+  final.set(tag, 16);
+  final.set(state, 26);
+
+  return bytesToBase64(final);
 }
 
 // ── Decrypt ───────────────────────────────────────────────────────────────────
 async function cipherDecrypt(text, key) {
-  const clean = [...text.toUpperCase()].filter(c => ALPHA.includes(c));
-  if (clean.length < 29) return '[error: message too short]';
-  const nonceStr = clean.slice(0, 16).join('');
+  let finalBytes;
+  try {
+    finalBytes = base64ToBytes(text.trim());
+  } catch (e) {
+    return '[error: invalid ciphertext format]';
+  }
 
-  // Bug 2 fixed: read 3-digit space count and 4-digit positions
-  const numSp  = _decNum(clean.slice(16, 19).join(''));
-  const hdrEnd = 19 + numSp * 4;
-  const spaces = Array.from({ length: numSp }, (_, i) =>
-    _decNum(clean.slice(19 + i * 4, 23 + i * 4).join(''))
-  );
-  const spHdr  = clean.slice(16, hdrEnd).join('');
-  const tagRcv = clean.slice(hdrEnd, hdrEnd + 10).join('');
-  const body   = clean.slice(hdrEnd + 10).join('');
+  if (finalBytes.length < 26) return '[error: message too short]';
 
-  const dk = await _derive(key, nonceStr);
+  const nonce = finalBytes.slice(0, 16);
+  const tagRcv = finalBytes.slice(16, 26);
+  const body = finalBytes.slice(26);
+
+  const dk = await _derive(key, nonce);
   const [, INV] = _makeSub(dk.slice(0, 32));
   const ksMaster = dk.slice(32, 64);
   const macKey   = dk.slice(64, 96);
 
-  const payload = nonceStr + spHdr + body;
-  const tagExp  = _toAlpha((await _hmac(macKey, new TextEncoder().encode(payload))).slice(0, 10));
-  if (tagRcv !== tagExp) return '[error: authentication failed — wrong key or tampered message]';
+  // Verify HMAC Authentication
+  const payload = new Uint8Array(nonce.length + body.length);
+  payload.set(nonce); payload.set(body, nonce.length);
 
-  let state = body.split('').map(c => ALPHA.indexOf(c));
+  const k = await crypto.subtle.importKey(
+    'raw', macKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const fullTag = new Uint8Array(await crypto.subtle.sign('HMAC', k, payload));
+  const tagExp = fullTag.slice(0, 10);
+
+  let match = true;
+  for(let i = 0; i < 10; i++) {
+    if (tagRcv[i] !== tagExp[i]) match = false;
+  }
+  if (!match) return '[error: authentication failed — wrong key or tampered message]';
+
+  let state = new Uint8Array(body);
+  
+  // Reverse 3-Round SPN
   for (let rnd = 2; rnd >= 0; rnd--) {
     state = _shuffle(state, 7 + rnd * 2);
     const rndBuf = new Uint8Array(ksMaster.length + 1);
     rndBuf.set(ksMaster); rndBuf[ksMaster.length] = rnd;
     const rndSeed = await _sha256(rndBuf);
     const keystream = await _ks(rndSeed, state.length);
-    const out = []; let prev = 0;
+    
+    const out = new Uint8Array(state.length);
+    let prev = 0;
     for (let i = 0; i < state.length; i++) {
-      const dec = ((state[i] - keystream[i] - prev) % 26 + 26) % 26;
-      out.push(INV[dec]); prev = state[i];
+      let dec = (state[i] - keystream[i] - prev) % 256;
+      if (dec < 0) dec += 256; // Standardize JS negative modulo
+      
+      out[i] = INV[dec];
+      prev = state[i];
     }
     state = out;
   }
-  const arr = state.map(v => ALPHA[v]);
-  for (const pos of [...spaces].sort((a, b) => a - b)) arr.splice(pos, 0, ' ');
-  return arr.join('');
+
+  try {
+    return new TextDecoder().decode(state);
+  } catch (e) {
+    return '[error: failed to decode text]';
+  }
 }
