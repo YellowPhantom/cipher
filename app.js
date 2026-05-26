@@ -68,9 +68,14 @@ function hideStatus() {
 // ── Process ───────────────────────────────────────────────────────────────────
 async function process() {
   if (processing) return;
-  const text = inputText.value.trim();
-      const key = keyInput.value.trim() || 'YELLOWPHANTOM';
-       if (!text) { showStatus('Please enter a message first.', 'error'); return; }
+  // Removed .trim() to allow intentional spaces/newlines at start or end of text
+  const text = inputText.value; 
+  const key = keyInput.value || 'YELLOWPHANTOM';
+  
+  if (!text.trim()) { 
+    showStatus('Please enter a message first.', 'error'); 
+    return; 
+  }
 
   processing = true;
   processBtn.disabled = true;
