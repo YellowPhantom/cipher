@@ -27,3 +27,5 @@ Simply open `index.html` in any modern web browser.
 2. Select whether you want to **Encrypt** or **Decrypt**.
 3. Type or paste your text into the input field.
 4. Click the Process button (or hit `Ctrl+Enter`).
+
+Alternatively, you can also go to https://cipher-yellowphantom364.vercel.app/.
